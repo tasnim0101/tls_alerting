@@ -1,0 +1,42 @@
+name: Check TLS appointment slots
+
+on:
+  schedule:
+    # Every 10 minutes. GitHub may delay this slightly under load.
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}  # lets you trigger a manual run from the Actions tab
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Run checker
+        env:
+          TLS_COOKIES_JSON: ${{ secrets.TLS_COOKIES_JSON }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+          ALERT_ON_ERROR: "0"  # set to "1" once you've confirmed everything works, to get notified if cookies expire
+        run: python check_appointments.py
+
+      - name: Upload screenshot (debugging)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: page-state
+          path: page_state.png
+          retention-days: 2
