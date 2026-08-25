@@ -21,15 +21,35 @@ from playwright.sync_api import sync_playwright
 URL = "https://visas-fr.tlscontact.com/workflow/appointment-booking/tnTUN2fr/28361308"
 
 # Phrases that indicate NO appointments are available (French TLScontact UI).
-# If NONE of these are found on the page, we assume something changed and alert.
+# These are the *exact* phrases confirmed on the real page. If NONE of these
+# are found, we assume something changed and alert.
 NO_SLOTS_PHRASES = [
+    "n'avons actuellement plus de cr\u00e9neaux de rendez-vous disponibles",
+    "aucun cr\u00e9neau n'est disponible pour le moment",
+    "aucun cr\u00e9neau",  # broader fallback
+    "plus de cr\u00e9neaux de rendez-vous disponibles",  # broader fallback
+    # Older/generic fallbacks kept in case wording varies elsewhere:
     "aucun rendez-vous",
     "aucune disponibilit",
     "no appointment",
     "no availability",
-    "pas de cr\u00e9neau",
-    "pas de rendez-vous disponible",
 ]
+
+# Phrases suggesting the session isn't actually logged in (expired/invalid
+# cookies), so a "no NO_SLOTS_PHRASES found" result would be a false alarm,
+# not real news.
+LOGGED_OUT_PHRASES = [
+    "se connecter",
+    "connexion",
+    "identifiant",
+    "mot de passe",
+    "sign in",
+    "log in",
+    "session expir",
+    "veuillez vous connecter",
+]
+
+MIN_EXPECTED_COOKIES = 6  # a real logged-in session usually has more than 4
 
 
 def _normalize_same_site(value):
@@ -96,14 +116,20 @@ def send_email(subject: str, body: str):
         server.sendmail(gmail_user, [to_addr], msg.as_string())
 
 
-def check_once() -> bool:
-    """Returns True if slots appear to be available."""
+def check_once() -> str:
+    """Returns one of: 'slots', 'no_slots', 'logged_out'."""
     print("check_appointments.py version: cookie-normalizer-v2")
     cookies = load_cookies()
 
     # Debug: show what we're about to hand Playwright (no cookie values).
     same_site_summary = [(c["name"], c["sameSite"]) for c in cookies]
     print(f"Loaded {len(cookies)} cookies. name/sameSite pairs: {same_site_summary}")
+    if len(cookies) < MIN_EXPECTED_COOKIES:
+        print(
+            f"WARNING: only {len(cookies)} cookies loaded, fewer than the "
+            f"expected {MIN_EXPECTED_COOKIES}+ for a real logged-in session. "
+            "Re-export cookies while fully logged in and on the appointment page."
+        )
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -128,24 +154,31 @@ def check_once() -> bool:
         page.wait_for_timeout(4000)
 
         content = page.content().lower()
+        # Normalize curly/smart apostrophes to plain ones so phrase matching
+        # doesn't depend on which one the site happens to render.
+        content = content.replace("\u2019", "'").replace("\u2018", "'")
         screenshot_path = "page_state.png"
         page.screenshot(path=screenshot_path, full_page=True)
 
         browser.close()
 
+    if any(phrase in content for phrase in LOGGED_OUT_PHRASES):
+        print("Page looks like a login/session-expired page, not the appointment page.")
+        return "logged_out"
+
     no_slots = any(phrase in content for phrase in NO_SLOTS_PHRASES)
 
     if no_slots:
         print("No slots detected (matched a 'no availability' phrase).")
-        return False
+        return "no_slots"
 
-    print("No 'no availability' phrase matched — slots might be open!")
-    return True
+    print("No 'no availability' phrase matched, and page looks logged in — slots might be open!")
+    return "slots"
 
 
 def main():
     try:
-        slots_available = check_once()
+        result = check_once()
     except Exception as exc:  # noqa: BLE001
         print(f"Check failed with an error: {exc}", file=sys.stderr)
         # Optionally email yourself on repeated failures (e.g. cookies expired)
@@ -156,7 +189,7 @@ def main():
             )
         sys.exit(1)
 
-    if slots_available:
+    if result == "slots":
         send_email(
             "TLScontact: possible appointment slot available!",
             f"The checker no longer sees a 'no availability' message on:\n{URL}\n\n"
@@ -164,6 +197,16 @@ def main():
             "(A screenshot was saved as a workflow artifact for reference.)",
         )
         print("Alert email sent.")
+    elif result == "logged_out":
+        print("Session appears logged out — re-export your cookies. No alert sent (would be a false positive).")
+        if os.environ.get("ALERT_ON_ERROR") == "1":
+            send_email(
+                "[TLS checker] Session expired — please refresh cookies",
+                "The checker landed on what looks like a login page instead of "
+                "the appointment page. Your session cookies have likely expired "
+                "— re-export them from your browser and update the "
+                "TLS_COOKIES_JSON secret.",
+            )
     else:
         print("Still no appointments. No email sent.")
 
