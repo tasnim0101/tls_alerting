@@ -14,11 +14,15 @@ import json
 import os
 import smtplib
 import sys
+import time
 from email.mime.text import MIMEText
 
 from playwright.sync_api import sync_playwright
 
 URL = "https://visas-fr.tlscontact.com/workflow/appointment-booking/tnTUN2fr/28361308"
+
+STATE_FILE = "state.json"
+LOGGED_OUT_ALERT_COOLDOWN_HOURS = 4
 
 # Phrases that indicate NO appointments are available (French TLScontact UI).
 # These are the *exact* phrases confirmed on the real page. If NONE of these
@@ -49,7 +53,44 @@ LOGGED_OUT_PHRASES = [
     "veuillez vous connecter",
 ]
 
+# Phrases suggesting Cloudflare (or similar) is showing an interstitial
+# challenge page instead of the real site content.
+BLOCKED_PHRASES = [
+    "just a moment",
+    "checking your browser",
+    "attention required",
+    "cf-browser-verification",
+    "verify you are human",
+    "please wait while we verify",
+    "ray id",
+]
+
 MIN_EXPECTED_COOKIES = 6  # a real logged-in session usually has more than 4
+
+
+def _load_state() -> dict:
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_state(state: dict):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f)
+
+
+def should_send_cooldown_alert(key: str, cooldown_hours: float) -> bool:
+    state = _load_state()
+    last = state.get(key, 0)
+    if time.time() - last < cooldown_hours * 3600:
+        return False
+    state[key] = time.time()
+    _save_state(state)
+    return True
 
 
 def _normalize_same_site(value):
@@ -117,7 +158,7 @@ def send_email(subject: str, body: str):
 
 
 def check_once() -> str:
-    """Returns one of: 'slots', 'no_slots', 'logged_out'."""
+    """Returns one of: 'no_slots', 'logged_out', 'blocked', 'uncertain'."""
     print("check_appointments.py version: cookie-normalizer-v2")
     cookies = load_cookies()
 
@@ -150,17 +191,42 @@ def check_once() -> str:
         page = context.new_page()
 
         page.goto(URL, wait_until="networkidle", timeout=45000)
-        # Give any lazy-loaded calendar/slot widget a moment to render.
-        page.wait_for_timeout(4000)
 
-        content = page.content().lower()
-        # Normalize curly/smart apostrophes to plain ones so phrase matching
-        # doesn't depend on which one the site happens to render.
-        content = content.replace("\u2019", "'").replace("\u2018", "'")
+        # Poll for up to ~20s: keep re-checking content as the page finishes
+        # rendering, instead of trusting one fixed-length sleep. Stop early
+        # the moment we recognize a known state.
+        content = ""
+        for _ in range(10):
+            content = page.content().lower()
+            content = content.replace("\u2019", "'").replace("\u2018", "'")
+            if (
+                any(p in content for p in NO_SLOTS_PHRASES)
+                or any(p in content for p in LOGGED_OUT_PHRASES)
+                or any(p in content for p in BLOCKED_PHRASES)
+            ):
+                break
+            page.wait_for_timeout(2000)
+
         screenshot_path = "page_state.png"
         page.screenshot(path=screenshot_path, full_page=True)
 
+        final_url = page.url
+        title = page.title()
         browser.close()
+
+    # Debug: which category each phrase list matched, plus page identity —
+    # deliberately not printing the raw page content (could contain your
+    # personal application details, and this may be a public repo's logs).
+    print(f"Final URL: {final_url}")
+    print(f"Page title: {title}")
+    print(f"Content length: {len(content)} chars")
+    print(f"NO_SLOTS matched: {[p for p in NO_SLOTS_PHRASES if p in content]}")
+    print(f"LOGGED_OUT matched: {[p for p in LOGGED_OUT_PHRASES if p in content]}")
+    print(f"BLOCKED matched: {[p for p in BLOCKED_PHRASES if p in content]}")
+
+    if any(phrase in content for phrase in BLOCKED_PHRASES):
+        print("Page looks like a bot-check / interstitial page, not real content.")
+        return "blocked"
 
     if any(phrase in content for phrase in LOGGED_OUT_PHRASES):
         print("Page looks like a login/session-expired page, not the appointment page.")
@@ -172,8 +238,12 @@ def check_once() -> str:
         print("No slots detected (matched a 'no availability' phrase).")
         return "no_slots"
 
-    print("No 'no availability' phrase matched, and page looks logged in — slots might be open!")
-    return "slots"
+    print(
+        "No known phrase matched (not 'no slots', not logged-out, not blocked). "
+        "This is ambiguous — could be real slots, or could be an unrecognized "
+        "page state. Flagging as 'uncertain' rather than claiming slots are open."
+    )
+    return "uncertain"
 
 
 def main():
@@ -189,26 +259,52 @@ def main():
             )
         sys.exit(1)
 
-    if result == "slots":
-        send_email(
-            "TLScontact: possible appointment slot available!",
-            f"The checker no longer sees a 'no availability' message on:\n{URL}\n\n"
-            "Go check and book immediately — slots disappear fast.\n"
-            "(A screenshot was saved as a workflow artifact for reference.)",
-        )
-        print("Alert email sent.")
-    elif result == "logged_out":
-        print("Session appears logged out — re-export your cookies. No alert sent (would be a false positive).")
-        if os.environ.get("ALERT_ON_ERROR") == "1":
+    if result == "no_slots":
+        print("Still no appointments. No email sent.")
+        return
+
+    if result == "logged_out":
+        print("Session appears logged out — re-export your cookies.")
+        if should_send_cooldown_alert("last_logged_out_alert", LOGGED_OUT_ALERT_COOLDOWN_HOURS):
             send_email(
                 "[TLS checker] Session expired — please refresh cookies",
                 "The checker landed on what looks like a login page instead of "
                 "the appointment page. Your session cookies have likely expired "
                 "— re-export them from your browser and update the "
-                "TLS_COOKIES_JSON secret.",
+                "TLS_COOKIES_JSON secret.\n\n"
+                f"(You won't get another one of these for {LOGGED_OUT_ALERT_COOLDOWN_HOURS}h, "
+                "to avoid spamming you while you fix it.)",
             )
-    else:
-        print("Still no appointments. No email sent.")
+        return
+
+    if result == "blocked":
+        print("Page looks like a bot-check/interstitial page.")
+        if should_send_cooldown_alert("last_blocked_alert", LOGGED_OUT_ALERT_COOLDOWN_HOURS):
+            send_email(
+                "[TLS checker] Got a bot-check page, not the real site",
+                "The checker's request seems to have been intercepted by a "
+                "verification/interstitial page instead of loading the real "
+                "appointment page. This usually resolves itself, but if it "
+                "keeps happening the checker may need adjusting.\n\n"
+                f"(You won't get another one of these for {LOGGED_OUT_ALERT_COOLDOWN_HOURS}h.)",
+            )
+        return
+
+    if result == "uncertain":
+        print("Ambiguous page state — sending a 'please verify manually' alert, not a confident one.")
+        if should_send_cooldown_alert("last_uncertain_alert", 1):
+            send_email(
+                "TLScontact: page state changed — please check manually",
+                f"The checker no longer recognizes the page state on:\n{URL}\n\n"
+                "This does NOT confidently mean slots are open — it just means "
+                "the known 'no availability' message wasn't found. It could be "
+                "real news, or it could be a page change / rendering issue. "
+                "Please go check the site yourself.\n"
+                "(A screenshot was saved as a workflow artifact for reference.)\n\n"
+                "(You won't get another one of these for 1h, to avoid repeat pings "
+                "while the page stays in this state.)",
+            )
+        return
 
 
 if __name__ == "__main__":
