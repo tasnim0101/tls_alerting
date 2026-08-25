@@ -35,14 +35,15 @@ NO_SLOTS_PHRASES = [
 def _normalize_same_site(value):
     """Cookie-Editor uses values like 'no_restriction' / 'unspecified' / 'lax';
     Playwright requires exactly 'Strict', 'Lax', or 'None'."""
-    if not value:
+    try:
+        v = str(value).strip().lower()
+    except Exception:
         return "Lax"
-    v = str(value).strip().lower()
-    if v in ("no_restriction", "none"):
+    if v in ("no_restriction", "none", "none.", "null"):
         return "None"
-    if v in ("strict",):
+    if v == "strict":
         return "Strict"
-    # 'lax', 'unspecified', or anything else -> default to Lax
+    # 'lax', 'unspecified', '', 'true', 'false', or anything else -> Lax
     return "Lax"
 
 
@@ -97,7 +98,12 @@ def send_email(subject: str, body: str):
 
 def check_once() -> bool:
     """Returns True if slots appear to be available."""
+    print("check_appointments.py version: cookie-normalizer-v2")
     cookies = load_cookies()
+
+    # Debug: show what we're about to hand Playwright (no cookie values).
+    same_site_summary = [(c["name"], c["sameSite"]) for c in cookies]
+    print(f"Loaded {len(cookies)} cookies. name/sameSite pairs: {same_site_summary}")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -107,7 +113,14 @@ def check_once() -> bool:
                 "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             )
         )
-        context.add_cookies(cookies)
+        try:
+            context.add_cookies(cookies)
+        except Exception:
+            print("add_cookies failed. Full normalized cookie list (values redacted):")
+            for c in cookies:
+                redacted = {k: ("<redacted>" if k == "value" else v) for k, v in c.items()}
+                print(redacted)
+            raise
         page = context.new_page()
 
         page.goto(URL, wait_until="networkidle", timeout=45000)
