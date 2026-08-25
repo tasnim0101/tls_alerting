@@ -32,13 +32,52 @@ NO_SLOTS_PHRASES = [
 ]
 
 
+def _normalize_same_site(value):
+    """Cookie-Editor uses values like 'no_restriction' / 'unspecified' / 'lax';
+    Playwright requires exactly 'Strict', 'Lax', or 'None'."""
+    if not value:
+        return "Lax"
+    v = str(value).strip().lower()
+    if v in ("no_restriction", "none"):
+        return "None"
+    if v in ("strict",):
+        return "Strict"
+    # 'lax', 'unspecified', or anything else -> default to Lax
+    return "Lax"
+
+
 def load_cookies():
-    """Cookies exported from your logged-in browser session (JSON array)."""
+    """Cookies exported from your logged-in browser session (JSON array),
+    normalized into the exact shape Playwright expects."""
     raw = os.environ.get("TLS_COOKIES_JSON")
     if not raw:
         print("ERROR: TLS_COOKIES_JSON env var is missing.", file=sys.stderr)
         sys.exit(1)
-    return json.loads(raw)
+
+    raw_cookies = json.loads(raw)
+    normalized = []
+    for c in raw_cookies:
+        cookie = {
+            "name": c["name"],
+            "value": c["value"],
+            "domain": c.get("domain", ""),
+            "path": c.get("path", "/"),
+            "httpOnly": bool(c.get("httpOnly", False)),
+            "secure": bool(c.get("secure", False)),
+            "sameSite": _normalize_same_site(c.get("sameSite")),
+        }
+        # Browsers require Secure=true for SameSite=None cookies; enforce
+        # that here so Playwright doesn't reject the cookie.
+        if cookie["sameSite"] == "None":
+            cookie["secure"] = True
+        # Session cookies have no expiry; Cookie-Editor uses 'expirationDate'
+        # (seconds since epoch, float). Playwright wants 'expires' as the
+        # same, or -1 / omitted for a session cookie.
+        expiration = c.get("expirationDate")
+        if expiration:
+            cookie["expires"] = expiration
+        normalized.append(cookie)
+    return normalized
 
 
 def send_email(subject: str, body: str):
